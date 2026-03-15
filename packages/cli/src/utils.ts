@@ -39,34 +39,44 @@ export async function loadConfig(): Promise<ProjectConfig> {
   loadEnv({ path: join(root, ".env"), override: true });
 
   const configPath = join(root, "inkos.json");
+  let config: Record<string, unknown>;
+
   try {
     const raw = await readFile(configPath, "utf-8");
-    const config = JSON.parse(raw);
-
-    // .env overrides inkos.json for LLM settings
-    const env = process.env;
-    if (env.INKOS_LLM_PROVIDER) config.llm.provider = env.INKOS_LLM_PROVIDER;
-    if (env.INKOS_LLM_BASE_URL) config.llm.baseUrl = env.INKOS_LLM_BASE_URL;
-    if (env.INKOS_LLM_MODEL) config.llm.model = env.INKOS_LLM_MODEL;
-    if (env.INKOS_LLM_TEMPERATURE) config.llm.temperature = parseFloat(env.INKOS_LLM_TEMPERATURE);
-    if (env.INKOS_LLM_MAX_TOKENS) config.llm.maxTokens = parseInt(env.INKOS_LLM_MAX_TOKENS, 10);
-    if (env.INKOS_LLM_THINKING_BUDGET) config.llm.thinkingBudget = parseInt(env.INKOS_LLM_THINKING_BUDGET, 10);
-    if (env.INKOS_LLM_API_FORMAT) config.llm.apiFormat = env.INKOS_LLM_API_FORMAT;
-
-    // API key ONLY from env — never stored in inkos.json
-    const apiKey = env.INKOS_LLM_API_KEY;
-    if (!apiKey) {
-      throw new Error(
-        "INKOS_LLM_API_KEY not set. Run 'inkos config set-global' or add it to project .env file.",
-      );
-    }
-    config.llm.apiKey = apiKey;
-
-    return ProjectConfigSchema.parse(config);
-  } catch (e) {
+    config = JSON.parse(raw) as Record<string, unknown>;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") throw error;
     throw new Error(
       `inkos.json not found in ${root}.\nMake sure you are inside an InkOS project directory (cd into the project created by 'inkos init').`,
     );
+  }
+
+  const env = process.env;
+  const llm = config.llm as Record<string, unknown>;
+  if (env.INKOS_LLM_PROVIDER) llm.provider = env.INKOS_LLM_PROVIDER;
+  if (env.INKOS_LLM_BASE_URL) llm.baseUrl = env.INKOS_LLM_BASE_URL;
+  if (env.INKOS_LLM_MODEL) llm.model = env.INKOS_LLM_MODEL;
+  if (env.INKOS_LLM_TEMPERATURE) llm.temperature = parseFloat(env.INKOS_LLM_TEMPERATURE);
+  if (env.INKOS_LLM_MAX_TOKENS) llm.maxTokens = parseInt(env.INKOS_LLM_MAX_TOKENS, 10);
+  if (env.INKOS_LLM_THINKING_BUDGET) llm.thinkingBudget = parseInt(env.INKOS_LLM_THINKING_BUDGET, 10);
+  if (env.INKOS_LLM_API_FORMAT) llm.apiFormat = env.INKOS_LLM_API_FORMAT;
+
+  const apiKey = env.INKOS_LLM_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "INKOS_LLM_API_KEY not set. Run 'inkos config set-global' or add it to project .env file.",
+    );
+  }
+  llm.apiKey = apiKey;
+
+  try {
+    return ProjectConfigSchema.parse(config);
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new Error(`Invalid InkOS config: ${error.message}`);
+    }
+    throw error;
   }
 }
 
