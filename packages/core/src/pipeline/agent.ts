@@ -231,6 +231,10 @@ export async function runAgentLoop(
   for (let turn = 0; turn < maxTurns; turn++) {
     const result = await chatWithTools(config.client, config.model, messages, TOOLS);
 
+    if (!result.content && result.toolCalls.length === 0) {
+      throw new Error("Agent provider returned empty response without any tool calls");
+    }
+
     // Push assistant message to history
     messages.push({
       role: "assistant" as const,

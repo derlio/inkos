@@ -178,6 +178,7 @@ async function chatCompletionOpenAIChat(
   options: { readonly temperature: number; readonly maxTokens: number },
   webSearch?: boolean,
 ): Promise<LLMResponse> {
+  // Primary path: streaming chat.completions (best UX when provider supports proper SDK streaming)
   const stream = await client.chat.completions.create({
     model,
     messages: messages.map((m) => ({
@@ -196,22 +197,49 @@ async function chatCompletionOpenAIChat(
 
   for await (const chunk of stream) {
     const delta = chunk.choices[0]?.delta?.content;
-    if (delta) chunks.push(delta);
+    if (typeof delta === "string" && delta.length > 0) chunks.push(delta);
     if (chunk.usage) {
       inputTokens = chunk.usage.prompt_tokens ?? 0;
       outputTokens = chunk.usage.completion_tokens ?? 0;
     }
   }
 
-  const content = chunks.join("");
+  const streamedContent = chunks.join("");
+  if (streamedContent) {
+    return {
+      content: streamedContent,
+      usage: {
+        promptTokens: inputTokens,
+        completionTokens: outputTokens,
+        totalTokens: inputTokens + outputTokens,
+      },
+    };
+  }
+
+  // Fallback: some relay providers return SSE that curl can read, but OpenAI SDK streaming parser yields no deltas.
+  // Retry once with non-streaming response.
+  const completion = await client.chat.completions.create({
+    model,
+    messages: messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    })),
+    temperature: options.temperature,
+    max_tokens: options.maxTokens,
+    stream: false,
+  });
+
+  const content = completion.choices?.[0]?.message?.content ?? "";
   if (!content) throw new Error("LLM returned empty response");
 
+  const promptTokens = completion.usage?.prompt_tokens ?? 0;
+  const completionTokens = completion.usage?.completion_tokens ?? 0;
   return {
     content,
     usage: {
-      promptTokens: inputTokens,
-      completionTokens: outputTokens,
-      totalTokens: inputTokens + outputTokens,
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens,
     },
   };
 }
@@ -242,6 +270,26 @@ async function chatWithToolsOpenAIChat(
     stream: true,
   });
 
+  const streamedResult = await collectOpenAIChatToolStream(stream);
+  if (hasToolResult(streamedResult)) {
+    return streamedResult;
+  }
+
+  const completion = await client.chat.completions.create({
+    model,
+    messages: openaiMessages,
+    tools: openaiTools,
+    temperature: options.temperature,
+    max_tokens: options.maxTokens,
+    stream: false,
+  });
+
+  return parseOpenAIChatToolCompletion(completion);
+}
+
+async function collectOpenAIChatToolStream(
+  stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>,
+): Promise<ChatWithToolsResult> {
   let content = "";
   const toolCallMap = new Map<number, { id: string; name: string; arguments: string }>();
 
@@ -266,6 +314,24 @@ async function chatWithToolsOpenAIChat(
 
   const toolCalls: ToolCall[] = [...toolCallMap.values()];
   return { content, toolCalls };
+}
+
+function parseOpenAIChatToolCompletion(
+  completion: OpenAI.Chat.Completions.ChatCompletion,
+): ChatWithToolsResult {
+  const message = completion.choices[0]?.message;
+  const content = typeof message?.content === "string" ? message.content : "";
+  const toolCalls = (message?.tool_calls ?? []).map((toolCall) => ({
+    id: toolCall.id,
+    name: toolCall.function.name,
+    arguments: toolCall.function.arguments,
+  }));
+
+  if (hasToolResult({ content, toolCalls })) {
+    return { content, toolCalls };
+  }
+
+  throw new Error("LLM returned empty response");
 }
 
 function agentMessagesToOpenAIChat(
@@ -388,6 +454,26 @@ async function chatWithToolsOpenAIResponses(
     stream: true,
   });
 
+  const streamedResult = await collectOpenAIResponsesToolStream(stream);
+  if (hasToolResult(streamedResult)) {
+    return streamedResult;
+  }
+
+  const response = await client.responses.create({
+    model,
+    input,
+    tools: responsesTools,
+    temperature: options.temperature,
+    max_output_tokens: options.maxTokens,
+    stream: false,
+  });
+
+  return parseOpenAIResponsesToolCompletion(response);
+}
+
+async function collectOpenAIResponsesToolStream(
+  stream: AsyncIterable<OpenAI.Responses.ResponseStreamEvent>,
+): Promise<ChatWithToolsResult> {
   let content = "";
   const toolCalls: ToolCall[] = [];
 
@@ -405,6 +491,48 @@ async function chatWithToolsOpenAIResponses(
   }
 
   return { content, toolCalls };
+}
+
+function parseOpenAIResponsesToolCompletion(
+  response: OpenAI.Responses.Response,
+): ChatWithToolsResult {
+  const toolCalls = response.output
+    .filter((item) => item.type === "function_call")
+    .map((item) => ({
+      id: item.call_id,
+      name: item.name,
+      arguments: item.arguments,
+    }));
+  const content = extractOpenAIResponsesText(response);
+
+  if (hasToolResult({ content, toolCalls })) {
+    return { content, toolCalls };
+  }
+
+  throw new Error("LLM returned empty response");
+}
+
+function extractOpenAIResponsesText(
+  response: Pick<OpenAI.Responses.Response, "output_text" | "output">,
+): string {
+  if (typeof response.output_text === "string" && response.output_text.length > 0) {
+    return response.output_text;
+  }
+
+  for (const item of response.output) {
+    if (item.type !== "message") continue;
+    for (const contentItem of item.content) {
+      if (contentItem.type === "output_text") {
+        return contentItem.text;
+      }
+    }
+  }
+
+  return "";
+}
+
+function hasToolResult(result: ChatWithToolsResult): boolean {
+  return result.content.length > 0 || result.toolCalls.length > 0;
 }
 
 function agentMessagesToResponsesInput(
